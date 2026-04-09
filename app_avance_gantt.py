@@ -18,14 +18,22 @@ st.set_page_config(page_title="Dashboard Gantt de Avance de Producción", layout
 st.title("📊 Seguimiento de Producción por Operario (Diagrama de Gantt)")
 st.markdown("Visualización del tiempo que cada pieza transcurre en las distintas estaciones de trabajo.")
 
-# Archivo por defecto
-default_path = r"c:/Users/Cristhian.Rodriguez/Desktop/Antigravity Projects/ControlporOperario/grupopanamericano-resumen.xlsx"
+# Archivos por defecto (priorizando el Santo Grial macro-producción)
+default_paths = [
+    r"c:/Users/Cristhian.Rodriguez/Desktop/Antigravity Projects/ControlporOperario/Reporte_Produccion.xlsx",
+    r"c:/Users/Cristhian.Rodriguez/Desktop/Antigravity Projects/ControlporOperario/grupopanamericano-resumen.xlsx"
+]
 
-uploaded_file = st.file_uploader("Sube el archivo Excel de Producción por Operario", type=["xlsx", "xlsm"])
-file_path = uploaded_file if uploaded_file else (default_path if os.path.exists(default_path) else None)
+uploaded_file = st.file_uploader("Sube el archivo Excel (Producción o Seguimiento por Operario)", type=["xlsx", "xlsm"])
+file_path = uploaded_file
+if not file_path:
+    for p in default_paths:
+        if os.path.exists(p):
+            file_path = p
+            break
 
 if file_path is None:
-    st.warning(f"No se subió ningún archivo y no se encontró el archivo por defecto en {default_path}.")
+    st.warning("No se subió ningún archivo y no se encontraron archivos locales por defecto.")
 else:
     try:
         # Leer archivo
@@ -37,19 +45,51 @@ else:
         # Detectar columnas clave con flexibilidad
         cols = {c.lower(): c for c in df.columns}
         
+        # Detección de formato "Santo Grial" (Ancho)
+        es_formato_ancho = 'weldingDate' in df.columns or 'paintingDate' in df.columns
+        if es_formato_ancho:
+            station_map = {
+                'weldingDate': '03 - Soldado',
+                'templatingDate': '04 - Plantillado',
+                'reweldingDate': '05 - Resoldado',
+                'paintingDate': '06 - Pintado',
+                'finishDate': '12 - Finished'
+            }
+            date_cols = [c for c in station_map.keys() if c in df.columns]
+            id_vars = [c for c in df.columns if c not in date_cols]
+            
+            # Melt para llevar el archivo al mismo formato long de la app base
+            df = df.melt(id_vars=id_vars, value_vars=date_cols, var_name='estación de trabajo', value_name='fecha de trabajo')
+            
+            # Mapeo de estados y limpieza de fechas vacías
+            df['estación de trabajo'] = df['estación de trabajo'].map(station_map)
+            df = df.dropna(subset=['fecha de trabajo'])
+            
+            rename_map = {
+                'uniqueCode': 'codigo qr',
+                'code': 'codigo',
+                'weight': 'producción',
+                'workPlaceName': 'obra'
+            }
+            df = df.rename(columns=rename_map)
+            
+            # Refrescar dict de columnas
+            cols = {c.lower(): c for c in df.columns}
+            
         col_codigo = cols.get('codigo qr', cols.get('codigo unico', cols.get('codigo', next((c for c in df.columns if 'codigo' in c.lower()), None))))
         col_nombre = cols.get('codigo', next((c for c in df.columns if 'codigo' in c.lower() and c != col_codigo), None))
         col_fecha = cols.get('fecha de trabajo', next((c for c in df.columns if 'fecha' in c.lower()), None))
         col_estacion = cols.get('estación de trabajo', cols.get('estacin de trabajo', next((c for c in df.columns if 'estaci' in c.lower()), None)))
         col_obra = cols.get('obra', next((c for c in df.columns if 'obra' in c.lower()), None))
         col_peso = cols.get('producción', cols.get('produccin', cols.get('peso', next((c for c in df.columns if 'producc' in c.lower() or 'peso' in c.lower()), None))))
+
         
         if not all([col_codigo, col_fecha, col_estacion]):
             st.error("No se encontraron las columnas necesarias (Codigo, Fecha de trabajo, Estación de trabajo).")
             st.write("Columnas detectadas:", list(df.columns))
         else:
-            # Procesar datos
-            df['Fecha Real'] = pd.to_datetime(df[col_fecha], format='%d/%m/%Y', errors='coerce')
+            # Procesar datos (retiene horas si están disponibles)
+            df['Fecha Real'] = pd.to_datetime(df[col_fecha], dayfirst=True, errors='coerce')
             
             # Limpiar codificación de la columna estación
             df['Estacion cruda'] = df[col_estacion].apply(
@@ -120,13 +160,16 @@ else:
                 Order_Hint=('_order', 'min')  # Para preservar orden cronológico original en el mismo día
             ).reset_index()
             
-            # Calcular duración real en días hábiles antes de modificar para visualización
+            # Calcular duración real en días y en horas
             gantt_data['Duración (Días)'] = calcular_dias_habiles(gantt_data['Start'], gantt_data['Finish'])
             gantt_data['Duración (Días)'] = gantt_data['Duración (Días)'].apply(lambda x: x if x > 0 else 1)
+            gantt_data['Duración (Horas)'] = (gantt_data['Finish'] - gantt_data['Start']).dt.total_seconds() / 3600.0
+            gantt_data['Duración (Horas)'] = gantt_data['Duración (Horas)'].round(1)
             
             # Forzar la estación de Pintado a contabilizar exactamente 1 día de producción
             mask_pintado = gantt_data['Estacion Base'].str.contains('Pintado', case=False, na=False)
             gantt_data.loc[mask_pintado, 'Duración (Días)'] = 1
+            gantt_data.loc[mask_pintado, 'Duración (Horas)'] = 24.0
             gantt_data.loc[mask_pintado, 'Finish'] = gantt_data.loc[mask_pintado, 'Start']
             
             # Ajuste visual para el Gantt para que EVENTOS DEL MISMO DÍA no se encimen y se oculten
@@ -191,19 +234,21 @@ else:
             resumen_codigo = resumen_codigo.merge(ultimo_estado, on=col_codigo, how='left')
             resumen_codigo['Tiempo Total (Días)'] = calcular_dias_habiles(resumen_codigo['Fecha_Ingreso'], resumen_codigo['Fecha_Ultimo_Cambio'])
             resumen_codigo['Tiempo Total (Días)'] = resumen_codigo['Tiempo Total (Días)'].apply(lambda x: x if x > 0 else 1)
-            resumen_codigo['Fecha de Ingreso a Planta'] = resumen_codigo['Fecha_Ingreso'].dt.strftime('%d/%m/%Y')
-            resumen_codigo['Fecha de Último Movimiento'] = resumen_codigo['Fecha_Ultimo_Cambio'].dt.strftime('%d/%m/%Y')
+            resumen_codigo['Tiempo Total (Horas)'] = ((resumen_codigo['Fecha_Ultimo_Cambio'] - resumen_codigo['Fecha_Ingreso']).dt.total_seconds() / 3600.0).round(1)
+            
+            resumen_codigo['Fecha de Ingreso a Planta'] = resumen_codigo['Fecha_Ingreso'].dt.strftime('%d/%m/%Y %H:%M')
+            resumen_codigo['Fecha de Último Movimiento'] = resumen_codigo['Fecha_Ultimo_Cambio'].dt.strftime('%d/%m/%Y %H:%M')
             resumen_codigo.rename(columns={col_codigo: 'Código'}, inplace=True)
             resumen_codigo['Código'] = resumen_codigo['Código'].map(map_table)
-            resumen_cols = ['Código', 'Fecha de Ingreso a Planta', 'Fecha de Último Movimiento', 'Último Estado Registrado', 'Tiempo Total (Días)']
+            resumen_cols = ['Código', 'Fecha de Ingreso a Planta', 'Fecha de Último Movimiento', 'Último Estado Registrado', 'Tiempo Total (Días)', 'Tiempo Total (Horas)']
             resumen_codigo = resumen_codigo[resumen_cols]
             
-            detalle_estados = gantt_data[[col_codigo, 'Estacion Base', 'Start', 'Finish', 'Duración (Días)', 'Is_Anomaly']].copy()
-            detalle_estados['Fecha Inicio'] = detalle_estados['Start'].dt.strftime('%d/%m/%Y')
-            detalle_estados['Fecha Fin'] = detalle_estados['Finish'].dt.strftime('%d/%m/%Y')
+            detalle_estados = gantt_data[[col_codigo, 'Estacion Base', 'Start', 'Finish', 'Duración (Días)', 'Duración (Horas)', 'Is_Anomaly']].copy()
+            detalle_estados['Fecha Inicio'] = detalle_estados['Start'].dt.strftime('%d/%m/%Y %H:%M')
+            detalle_estados['Fecha Fin'] = detalle_estados['Finish'].dt.strftime('%d/%m/%Y %H:%M')
             detalle_estados.rename(columns={col_codigo: 'Código', 'Estacion Base': 'Estado / Estación'}, inplace=True)
             detalle_estados['Código'] = detalle_estados['Código'].map(map_table)
-            detalle_cols = ['Código', 'Estado / Estación', 'Fecha Inicio', 'Fecha Fin', 'Duración (Días)']
+            detalle_cols = ['Código', 'Estado / Estación', 'Fecha Inicio', 'Fecha Fin', 'Duración (Días)', 'Duración (Horas)']
             
             # --- RENDERIZADO DE TABS ---
             tab_normal, tab_anomalo = st.tabs(["✅ Producción Regular", "⚠️ Anomalías y Reprocesos"])
@@ -240,7 +285,7 @@ else:
                 else:
                     fig_normal = px.timeline(
                         gantt_normal, x_start="Start_Visual", x_end="Finish_Visual", y="Display_Chart", color="Estacion Base",
-                        hover_data={"Start_Visual": False, "Start": "|%d/%m/%Y", "Finish": "|%d/%m/%Y", "Finish_Visual": False, "Duración (Días)": True},
+                        hover_data={"Start_Visual": False, "Start": "|%d/%m/%Y %H:%M", "Finish": "|%d/%m/%Y %H:%M", "Finish_Visual": False, "Duración (Días)": True, "Duración (Horas)": True},
                     )
                     fig_normal.update_yaxes(autorange="reversed", showgrid=True, gridcolor='rgba(255,255,255,0.05)')
                     fig_normal.update_xaxes(showgrid=True, gridcolor='rgba(255,255,255,0.2)')
@@ -274,7 +319,7 @@ else:
                     
                     fig_anomalo = px.timeline(
                         gantt_anomalo, x_start="Start_Visual", x_end="Finish_Visual", y="Display_Chart", color="Estacion Base",
-                        hover_data={"Start_Visual": False, "Start": "|%d/%m/%Y", "Finish": "|%d/%m/%Y", "Finish_Visual": False, "Duración (Días)": True},
+                        hover_data={"Start_Visual": False, "Start": "|%d/%m/%Y %H:%M", "Finish": "|%d/%m/%Y %H:%M", "Finish_Visual": False, "Duración (Días)": True, "Duración (Horas)": True},
                     )
                     fig_anomalo.update_yaxes(autorange="reversed", showgrid=True, gridcolor='rgba(255,255,255,0.05)')
                     fig_anomalo.update_xaxes(showgrid=True, gridcolor='rgba(255,255,255,0.2)')
