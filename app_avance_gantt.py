@@ -253,11 +253,17 @@ else:
             resumen_codigo = resumen_codigo[resumen_cols]
             
             detalle_estados = gantt_data[[col_codigo, 'Estacion Base', 'Start', 'Finish', 'Duración (Días)', 'Duración (Horas)', 'Is_Anomaly']].copy()
-            detalle_estados['Fecha Inicio'] = detalle_estados['Start'].dt.strftime('%d/%m/%Y %H:%M')
-            detalle_estados['Fecha Fin'] = detalle_estados['Finish'].dt.strftime('%d/%m/%Y %H:%M')
+            es_instantaneo = detalle_estados['Start'] == detalle_estados['Finish']
+            
+            detalle_estados['Primer Escaneo'] = detalle_estados['Start'].dt.strftime('%d/%m/%Y %H:%M')
+            detalle_estados['Último Escaneo'] = detalle_estados['Finish'].dt.strftime('%d/%m/%Y %H:%M')
+            
+            detalle_estados['Retención en Estación'] = detalle_estados['Duración (Horas)'].astype(str) + " Horas"
+            detalle_estados.loc[es_instantaneo, 'Retención en Estación'] = "Momento Único"
+            
             detalle_estados.rename(columns={col_codigo: 'Código', 'Estacion Base': 'Estado / Estación'}, inplace=True)
             detalle_estados['Código'] = detalle_estados['Código'].map(map_table)
-            detalle_cols = ['Código', 'Estado / Estación', 'Fecha Inicio', 'Fecha Fin', 'Duración (Días)', 'Duración (Horas)']
+            detalle_cols = ['Código', 'Estado / Estación', 'Primer Escaneo', 'Último Escaneo', 'Retención en Estación']
             
             # --- RENDERIZADO DE TABS ---
             tab_normal, tab_anomalo, tab_costos = st.tabs(["✅ Producción Regular", "⚠️ Anomalías y Reprocesos", "💰 Análisis de Costos y Eficiencia"])
