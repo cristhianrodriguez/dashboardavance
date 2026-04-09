@@ -11,6 +11,15 @@ def calcular_dias_habiles(start_series, end_series):
     e = end_series.dt.date.values.astype('datetime64[D]')
     return np.busday_count(s, e, holidays=holidays)
 
+def calcular_horas_fabrica_netas(start_series, end_series):
+    dias = calcular_dias_habiles(start_series, end_series)
+    start_h = start_series.dt.hour + start_series.dt.minute / 60.0
+    end_h = end_series.dt.hour + end_series.dt.minute / 60.0
+    start_h = start_h.clip(6, 24)
+    end_h = end_h.clip(6, 24)
+    horas_netas = dias * 18.0 + end_h - start_h
+    return np.maximum(horas_netas, 0).round(1)
+
 st.set_page_config(page_title="Dashboard Gantt de Avance de Producción", layout="wide")
 
 # Función get_base_station original eliminada para usar mapeo dinámico en el procesamiento
@@ -251,7 +260,7 @@ else:
             detalle_cols = ['Código', 'Estado / Estación', 'Fecha Inicio', 'Fecha Fin', 'Duración (Días)', 'Duración (Horas)']
             
             # --- RENDERIZADO DE TABS ---
-            tab_normal, tab_anomalo = st.tabs(["✅ Producción Regular", "⚠️ Anomalías y Reprocesos"])
+            tab_normal, tab_anomalo, tab_costos = st.tabs(["✅ Producción Regular", "⚠️ Anomalías y Reprocesos", "💰 Análisis de Costos y Eficiencia"])
             
             with tab_normal:
                 st.subheader("📊 Resumen Global en Planta")
@@ -334,6 +343,63 @@ else:
                     st.dataframe(resumen_codigo[resumen_codigo['Código'].isin(anomalous_codes)], use_container_width=True, hide_index=True)
                     st.subheader("📋 Detalle de Estados (Irregulares)")
                     st.dataframe(detalle_estados[detalle_estados['Is_Anomaly']][detalle_cols], use_container_width=True, hide_index=True)
-            
+
+            with tab_costos:
+                st.subheader("📈 Producción Mensual (Kilos Terminados)")
+                eventos_pintura = df_valido[df_valido['Estacion Base'].str.contains('Pintado|Finished', case=False, na=False)].copy()
+                eventos_pintura = eventos_pintura.sort_values('Fecha Real').groupby(col_codigo).tail(1)
+                
+                if eventos_pintura.empty:
+                    st.info("No hay piezas que hayan alcanzado la estación de Pintado o Finished en el archivo.")
+                elif not col_peso:
+                    st.warning("No se encontró la columna de Producción/Peso en tu Excel original para calcular los kilos.")
+                else:
+                    meses_dict = {1: 'ENERO', 2: 'FEBRERO', 3: 'MARZO', 4: 'ABRIL', 5: 'MAYO', 6: 'JUNIO', 7: 'JULIO', 8: 'AGOSTO', 9: 'SEPTIEMBRE', 10: 'OCTUBRE', 11: 'NOVIEMBRE', 12: 'DICIEMBRE'}
+                    eventos_pintura['Mes Str'] = eventos_pintura['Fecha Real'].dt.month.map(meses_dict)
+                    eventos_pintura['Mes'] = eventos_pintura['Mes Str'] + " " + eventos_pintura['Fecha Real'].dt.year.astype(str)
+                    eventos_pintura['Semana'] = "SEMANA " + ((eventos_pintura['Fecha Real'].dt.day - 1) // 7 + 1).astype(str)
+                    eventos_pintura['_peso'] = pd.to_numeric(eventos_pintura[col_peso], errors='coerce').fillna(0)
+                    
+                    tabla_mensual = pd.pivot_table(eventos_pintura, values='_peso', index='Semana', columns='Mes', aggfunc='sum', fill_value=0)
+                    st.markdown("**Resumen de Kilos Pintados (agrupados por periodo de 7 días)**")
+                    st.dataframe(tabla_mensual.style.format("{:,.1f} Kg"), use_container_width=True)
+                    
+                    if not tabla_mensual.empty:
+                        bar_mensual = px.bar(tabla_mensual.reset_index(), x='Semana', y=tabla_mensual.columns, title="📊 Evolución de Kilos Pintados", barmode='group')
+                        bar_mensual.update_layout(plot_bgcolor='rgba(0,0,0,0)', paper_bgcolor='rgba(0,0,0,0)')
+                        st.plotly_chart(bar_mensual, use_container_width=True)
+                
+                st.markdown("---")
+                st.subheader("⏱️ Ciclo de Fabricación Total (Control de Costos)")
+                st.markdown("Desglose del tiempo real en planta desde el **primer registro operario** hasta la **llegada a pintura/despacho**. El cálculo utiliza exclusivamente el **turno de 18s horas hábiles (6:00 a 24:00)**.")
+                
+                if not eventos_pintura.empty:
+                    codigos_terminados = eventos_pintura[col_codigo].unique()
+                    df_terminados = df_valido[df_valido[col_codigo].isin(codigos_terminados)]
+                    
+                    # Obtenemos la tupla de fechas inicio y fin real
+                    inicio_fin = df_terminados.groupby(col_codigo)['Fecha Real'].agg(['min', 'max']).reset_index()
+                    
+                    # Aplicamos la formula alfanumerica
+                    inicio_fin['Horas Netas de Trabajo Fabricación'] = calcular_horas_fabrica_netas(inicio_fin['min'], inicio_fin['max'])
+                    
+                    inicio_fin['Inicio Producción'] = inicio_fin['min'].dt.strftime('%d/%m/%Y %H:%M')
+                    inicio_fin['Llegada a Finalización'] = inicio_fin['max'].dt.strftime('%d/%m/%Y %H:%M')
+                    
+                    if col_peso:
+                        pesos_map = df_terminados.groupby(col_codigo)[col_peso].first()
+                        inicio_fin['Peso (Kg)'] = inicio_fin[col_codigo].map(pesos_map)
+                        inicio_fin['Peso (Kg)'] = pd.to_numeric(inicio_fin['Peso (Kg)'], errors='coerce').fillna(0)
+                        inicio_fin['Tasa de Eficiencia (Kg/Hora Neta)'] = (inicio_fin['Peso (Kg)'] / inicio_fin['Horas Netas de Trabajo Fabricación'].replace(0, 1)).round(2)
+                    
+                    inicio_fin['Pieza / Conjunto'] = inicio_fin[col_codigo].map(map_table)
+                    
+                    if col_peso:
+                        cols_costo = ['Pieza / Conjunto', 'Peso (Kg)', 'Inicio Producción', 'Llegada a Finalización', 'Horas Netas de Trabajo Fabricación', 'Tasa de Eficiencia (Kg/Hora Neta)']
+                    else:
+                        cols_costo = ['Pieza / Conjunto', 'Inicio Producción', 'Llegada a Finalización', 'Horas Netas de Trabajo Fabricación']
+                        
+                    st.dataframe(inicio_fin[cols_costo].sort_values('Llegada a Finalización', ascending=False), hide_index=True, use_container_width=True)
+
     except Exception as e:
         st.error(f"Error procesando el archivo: {e}")
